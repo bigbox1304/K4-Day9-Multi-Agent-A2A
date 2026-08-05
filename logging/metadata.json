@@ -1,0 +1,6 @@
+{
+  "model_name": "gpt-4o-mini",
+  "parameter_size": "Unknown (OpenAI)",
+  "framework": "openai + python/pandas",
+  "runtime": "2026-08-05T17:35:57.394836"
+}
