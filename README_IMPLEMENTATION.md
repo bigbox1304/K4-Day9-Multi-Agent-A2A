@@ -20,7 +20,11 @@ The runner requires exactly 50 input files and an available LLM endpoint. It int
 
 The specialist agents are intentionally isolated by domain. They each call the configured LLM, then hand off structured JSON and evidence to the Policy Agent; they do not mutate one another's results. Python is used for CSV retrieval, context construction, output assembly and structural safety validation. The policy decision and domain analyses come from the LLM agents. The selected model identity is recorded in `metadata.json`.
 
-Set `LLM_BASE_URL` to an OpenAI-compatible endpoint serving the declared sub-10B model. `LLM_API_KEY` is read from the environment and never written to trace or output. The runner intentionally fails when no LLM endpoint is configured; it does not fall back to a rule-only pipeline. The default example uses OpenRouter's `qwen/qwen3-8b`.
+Set `LLM_BASE_URL` to an OpenAI-compatible endpoint serving the declared sub-10B model. `LLM_API_KEY` is read from the environment and never written to trace or output. By default, all agents use deterministic CSV tools, so the 50-case run does not wait on model inference. Set `LLM_ORCHESTRATION_MODE=hybrid` to use one LLM policy handoff per case, or `LLM_ORCHESTRATION_MODE=full` to make all specialist and verifier calls use the LLM. The default example uses OpenRouter's `qwen/qwen3-8b:free` route.
+
+`LLM_MAX_TOKENS` controls the per-request output budget. A value around `1536` is sufficient for the JSON agent contracts and reduces API credit usage.
+
+`SPECIALIST_CONCURRENCY=2` limits simultaneous specialist calls. The client retries transient OpenRouter 429 responses with exponential backoff.
 
 ## Submission checklist
 

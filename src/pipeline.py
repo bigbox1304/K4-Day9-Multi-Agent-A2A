@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 
-MODEL_NAME = "qwen/qwen3-8b"
+MODEL_NAME = "qwen3:8b"
 POLICY_VERSION = "EC_POLICY_V2"
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -69,6 +69,7 @@ class DataStore:
             for row in self.translations
         }
         self.orders_by_customer_unique = defaultdict(list)
+        self.order_ids_by_customer_id = defaultdict(list)
 
         for row in self.items:
             self.items_by_order[row["order_id"]].append(row)
@@ -78,6 +79,10 @@ class DataStore:
             self.orders_by_customer_unique[customer["customer_unique_id"]].append(
                 customer["customer_id"]
             )
+        for order in self.orders:
+            self.order_ids_by_customer_id[order.get("customer_id", "")].append(
+                order.get("order_id", "")
+            )
 
     def context(self, order_id: str) -> Dict[str, Any]:
         order = self.orders_by_id.get(order_id, {})
@@ -86,10 +91,9 @@ class DataStore:
         customer_ids = self.orders_by_customer_unique.get(customer_unique_id, [])
         # The customer table has customer_id, not order_id. Resolve the related orders.
         related_customer_ids = [cid for cid in customer_ids if cid != order.get("customer_id")]
-        related_orders = [
-            row["order_id"] for row in self.orders
-            if row.get("customer_id") in related_customer_ids
-        ]
+        related_orders = []
+        for customer_id in related_customer_ids:
+            related_orders.extend(self.order_ids_by_customer_id.get(customer_id, []))
         return {
             "order": order,
             "customer": customer,
@@ -278,15 +282,70 @@ class VerifierAgent:
                     "root_cause_analysis", "evidence_ids", "financial_resolution", "resolution_actions"]
         errors.extend(f"missing:{key}" for key in required if key not in output)
         assessment = output.get("case_assessment", {})
-        if assessment.get("confidence", -1) < 0 or assessment.get("confidence", 2) > 1:
+        allowed_primary = {"canceled_order_paid", "unavailable_order_paid", "late_delivery_seller", "late_delivery_logistics", "valid_split_payment", "unsupported_late_claim"}
+        allowed_secondary = {"multi_item_order", "multi_seller_order", "split_payment", "repeat_customer", "multiple_categories"}
+        allowed_status = {"action_required", "no_action"}
+        allowed_causes = {"SELLER_HANDOFF_AFTER_LIMIT", "CARRIER_DELIVERED_AFTER_ESTIMATE", "ORDER_CANCELED_AFTER_PAYMENT", "ORDER_UNAVAILABLE_AFTER_PAYMENT", "MULTIPLE_PAYMENTS_RECONCILED", "DELIVERY_WITHIN_ESTIMATE"}
+        allowed_actions = {"issue_full_refund", "refund_freight", "explain_valid_split_payment", "reject_late_refund", "review_seller_handoff", "review_carrier_delay", "verify_refund_completion", "coordinate_multi_seller_case", "verify_payment_allocation"}
+        if assessment.get("primary_issue") not in allowed_primary:
+            errors.append("invalid:primary_issue")
+        if assessment.get("case_status") not in allowed_status:
+            errors.append("invalid:case_status")
+        if not isinstance(assessment.get("secondary_issues"), list) or any(x not in allowed_secondary for x in assessment.get("secondary_issues", [])):
+            errors.append("invalid:secondary_issues")
+        confidence = assessment.get("confidence")
+        if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
             errors.append("confidence_out_of_range")
         for key, limit in [("order_ids", 5), ("item_ids", 5), ("seller_ids", 3), ("payment_ids", 5)]:
             if len(output.get("affected_entities", {}).get(key, [])) > limit:
                 errors.append(f"limit:{key}")
-        if len(output.get("evidence_ids", [])) > 20: errors.append("limit:evidence_ids")
-        for evidence in output.get("evidence_ids", []):
+        entities = output.get("affected_entities", {})
+        case_order_ids = entities.get("order_ids", [])
+        if len(case_order_ids) != 1 or not all(x in store.orders_by_id for x in case_order_ids):
+            errors.append("invalid:affected_order_ids")
+        order_id = case_order_ids[0] if case_order_ids else None
+        valid_items = {f"{order_id}:{row.get('order_item_id')}" for row in store.items_by_order.get(order_id, [])} if order_id else set()
+        if any(x not in valid_items for x in entities.get("item_ids", [])):
+            errors.append("invalid:item_ids")
+        valid_sellers = {row.get("seller_id") for row in store.items_by_order.get(order_id, [])} if order_id else set()
+        if any(x not in valid_sellers for x in entities.get("seller_ids", [])):
+            errors.append("invalid:seller_ids")
+        valid_payments = {f"{order_id}:{row.get('payment_sequential')}" for row in store.payments_by_order.get(order_id, [])} if order_id else set()
+        if any(x not in valid_payments for x in entities.get("payment_ids", [])):
+            errors.append("invalid:payment_ids")
+        customer_context = output.get("customer_context", {})
+        if customer_context.get("customer_unique_id") and not any(row.get("customer_unique_id") == customer_context.get("customer_unique_id") for row in store.customers):
+            errors.append("invalid:customer_unique_id")
+        root = output.get("root_cause_analysis", {})
+        if not isinstance(root.get("ranked_causes"), list) or any(not isinstance(x, dict) or x.get("cause_code") not in allowed_causes or not isinstance(x.get("rank"), int) for x in root.get("ranked_causes", [])):
+            errors.append("invalid:ranked_causes")
+        if not isinstance(root.get("responsible_parties"), list) or any(not isinstance(x, dict) or x.get("party_type") not in {"seller", "platform", "logistics_provider"} or not x.get("party_id") for x in root.get("responsible_parties", [])):
+            errors.append("invalid:responsible_parties")
+        if not isinstance(output.get("resolution_actions"), list) or any(x not in allowed_actions for x in output.get("resolution_actions", [])):
+            errors.append("invalid:resolution_actions")
+        financial = output.get("financial_resolution", {})
+        if financial.get("currency") != "BRL" or not isinstance(financial.get("recommended_refund_brl"), (int, float)):
+            errors.append("invalid:financial_resolution")
+        payment = output.get("payment_reconciliation", {})
+        if payment.get("currency") != "BRL":
+            errors.append("invalid:payment_currency")
+        evidence_ids = output.get("evidence_ids")
+        if not isinstance(evidence_ids, list):
+            errors.append("invalid:evidence_ids")
+            evidence_ids = []
+        if len(evidence_ids) > 20: errors.append("limit:evidence_ids")
+        for evidence in evidence_ids:
             if not (evidence.startswith(("order:", "item:", "payment:", "seller:", "policy:"))):
                 errors.append(f"invalid_evidence:{evidence}")
+        if any(e.startswith("item:") and e not in {f"item:{x}" for x in entities.get("item_ids", [])} for e in evidence_ids):
+            errors.append("invalid:item_evidence")
+        if any(e.startswith("payment:") and e not in {f"payment:{x}" for x in entities.get("payment_ids", [])} for e in evidence_ids):
+            errors.append("invalid:payment_evidence")
+        if any(e.startswith("seller:") and e not in {f"seller:{x}" for x in entities.get("seller_ids", [])} for e in evidence_ids):
+            errors.append("invalid:seller_evidence")
+        for e in evidence_ids:
+            if e.startswith("order:") and e != f"order:{order_id}": errors.append("invalid:order_evidence")
+            if e.startswith("policy:") and e.split(":", 1)[1] not in allowed_causes: errors.append("invalid:policy_evidence")
         if not output.get("case_id"): errors.append("empty_case_id")
         return errors
 
