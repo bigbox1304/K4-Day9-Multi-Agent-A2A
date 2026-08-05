@@ -1,0 +1,7 @@
+{
+  "model": "qwen/qwen3-8b",
+  "parameter_size": "8.19B",
+  "framework": "OpenAI-compatible local LLM endpoint with Python multi-agent orchestration",
+  "runtime": "OpenRouter API",
+  "policy_version": "EC_POLICY_V2"
+}
